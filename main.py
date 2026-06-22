@@ -6,13 +6,13 @@ class TimeDisplay(Static):
     pass
 
 
-class Stopwatch(Static):
+class StopWatch(Static):
     # custom stopwatch widget
     # define the compose method to define how it will layout things
     #
     def compose(self):
-        yield Button("Start")
-        yield Button("Stop")
+        yield Button("Start", variant="success")
+        yield Button("Stop", variant="error")
         yield Button("Reset")
         yield TimeDisplay("00:00:00.00")
 
@@ -29,6 +29,7 @@ class Jikan(App):
         # yield Button("Stop")
         yield Header(show_clock=True)
         yield Footer()
+        yield StopWatch()
 
     def action_toggle_dark_mode(self):
         # name of the method shoule be prefixed with action
