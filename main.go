@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -11,7 +14,12 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const tickInterval = time.Second
+const (
+	tickInterval       = time.Second
+	defaultDBPath      = "jikan.db"
+	defaultCSVPath     = "jikan_sessions.csv"
+	statusMessageWidth = 96
+)
 
 type project struct {
 	Name    string
@@ -26,6 +34,8 @@ type model struct {
 	active    int
 	startedAt time.Time
 	now       time.Time
+	store     sessionStore
+	status    string
 
 	creating bool
 	input    textinput.Model
@@ -88,11 +98,43 @@ var (
 )
 
 func main() {
-	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		fmt.Fprintf(os.Stderr, "jikan: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func run(args []string) error {
+	flags := flag.NewFlagSet("jikan", flag.ContinueOnError)
+	dbPath := flags.String("db", defaultDBPath, "path to the sqlite database")
+	exportPath := flags.String("export", "", "export tracked sessions to a CSV file and exit")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	store, err := openSQLiteSessionStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	if *exportPath != "" {
+		count, err := store.ExportCSV(context.Background(), *exportPath)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stdout, "exported %d sessions to %s\n", count, *exportPath)
+		return nil
+	}
+
+	p := tea.NewProgram(newModelWithStore(time.Now(), store), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func newModel() model {
@@ -100,6 +142,10 @@ func newModel() model {
 }
 
 func newModelAt(now time.Time) model {
+	return newModelWithStore(now, nil)
+}
+
+func newModelWithStore(now time.Time, store sessionStore) model {
 	input := textinput.New()
 	input.Placeholder = "New project"
 	input.CharLimit = 48
@@ -116,6 +162,7 @@ func newModelAt(now time.Time) model {
 		},
 		active: -1,
 		now:    now,
+		store:  store,
 		input:  input,
 		width:  86,
 		height: 24,
@@ -148,6 +195,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "ctrl+c", "q":
+			m.stopActive()
 			return m, tea.Quit
 		case "up", "k":
 			m.moveCursor(-1)
@@ -157,11 +205,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toggleSelected()
 		case "n":
 			m.creating = true
+			m.status = ""
 			m.input.SetValue("")
 			m.input.Focus()
 			return m, textinput.Blink
 		case "r":
 			m.resetSelected()
+		case "e":
+			m.exportSessions(defaultCSVPath)
 		}
 	}
 
@@ -171,9 +222,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateCreation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
+		m.stopActive()
 		return m, tea.Quit
 	case "esc":
 		m.creating = false
+		m.status = ""
 		m.input.Blur()
 		m.input.SetValue("")
 		return m, nil
@@ -185,6 +238,7 @@ func (m model) updateCreation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.projects = append(m.projects, project{Name: name})
 		m.cursor = len(m.projects) - 1
 		m.creating = false
+		m.status = fmt.Sprintf("added %s", trimToWidth(name, statusMessageWidth))
 		m.input.Blur()
 		m.input.SetValue("")
 		return m, nil
@@ -229,9 +283,43 @@ func (m *model) stopActive() {
 		return
 	}
 
-	m.projects[m.active].Elapsed += elapsedSince(m.startedAt, m.now)
+	projectName := m.projects[m.active].Name
+	duration := elapsedSince(m.startedAt, m.now)
+	m.projects[m.active].Elapsed += duration
+	if err := m.recordSession(projectName, m.startedAt, m.now, duration); err != nil {
+		m.status = fmt.Sprintf("save failed: %s", trimToWidth(err.Error(), statusMessageWidth))
+	} else if duration > 0 {
+		m.status = fmt.Sprintf("saved %s %s", trimToWidth(projectName, 48), formatDuration(duration))
+	}
 	m.active = -1
 	m.startedAt = time.Time{}
+}
+
+func (m *model) recordSession(projectName string, startedAt, endedAt time.Time, duration time.Duration) error {
+	if duration <= 0 || m.store == nil {
+		return nil
+	}
+
+	return m.store.RecordSession(context.Background(), trackedSession{
+		ProjectName: projectName,
+		StartedAt:   startedAt,
+		EndedAt:     endedAt,
+		Duration:    duration,
+	})
+}
+
+func (m *model) exportSessions(path string) {
+	if m.store == nil {
+		m.status = "export unavailable: no session store"
+		return
+	}
+
+	count, err := m.store.ExportCSV(context.Background(), path)
+	if err != nil {
+		m.status = fmt.Sprintf("export failed: %s", trimToWidth(err.Error(), statusMessageWidth))
+		return
+	}
+	m.status = fmt.Sprintf("exported %d sessions to %s", count, path)
 }
 
 func (m *model) resetSelected() {
@@ -243,6 +331,7 @@ func (m *model) resetSelected() {
 	if m.active == m.cursor {
 		m.startedAt = m.now
 	}
+	m.status = fmt.Sprintf("reset display total for %s", trimToWidth(m.projects[m.cursor].Name, 48))
 }
 
 func (m model) elapsedFor(index int) time.Duration {
@@ -289,7 +378,11 @@ func (m model) View() string {
 	}
 
 	b.WriteString("\n\n")
-	b.WriteString(helpStyle.Render("j/k move  space start/stop  n new  r reset  q quit"))
+	if m.status != "" {
+		b.WriteString(mutedStyle.Render(trimToWidth(m.status, width)))
+		b.WriteString("\n\n")
+	}
+	b.WriteString(helpStyle.Render("j/k move  space start/stop  n new  r reset  e export  q quit"))
 
 	return baseStyle.Render(frameStyle.Width(frameWidth).Render(b.String()))
 }
