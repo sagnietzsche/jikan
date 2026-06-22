@@ -3,19 +3,24 @@ from textual.widgets import Footer, Header, Static, Button
 from textual.containers import ScrollableContainer
 
 
+# use css to style the things in the terminal
+
+
 class TimeDisplay(Static):
+    # custom time display widget
     pass
 
 
 class StopWatch(Static):
     # custom stopwatch widget
     # define the compose method to define how it will layout things
-    #
     def compose(self):
         yield Button("Start", variant="success")
         yield Button("Stop", variant="error")
         yield Button("Reset")
         yield TimeDisplay("00:00:00.00")
+
+    CSS_PATH = "stopwatch.css"
 
 
 class Jikan(App):
